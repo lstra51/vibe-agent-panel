@@ -101,7 +101,8 @@ Keep Basic Auth or another access control layer enabled before exposing the pane
 curl -fsS http://127.0.0.1:3000/api/status
 curl -fsS http://127.0.0.1:3000/api/profiles
 python3 scripts/smoke_task.py
+python3 scripts/smoke_codex_login.py
 ```
 
 The smoke task requires a configured DeepSeek key in the default Vibe Profile.
-
+The Codex login smoke test only verifies that the device-auth flow starts; it does not complete account login.
