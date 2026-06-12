@@ -31,6 +31,7 @@ const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 migrate();
 ensureDefaultProfile();
+markInterruptedAgentRuns();
 
 const running = new Map();
 const taskSockets = new Map();
@@ -600,6 +601,7 @@ function agentContext() {
     startAgentTurn,
     completeAgentTurn,
     failAgentTurn,
+    markAgentSessionLost,
     listAgentEvents,
     appendAgentEvent,
     listAgentApprovals,
@@ -704,11 +706,22 @@ function listAgentEvents(sessionId) {
 }
 
 function appendAgentEvent({ sessionId, turnId = null, source, type, role = null, summary = null, text = '', payload = {} }) {
+  const createdAt = now();
   db.prepare(`
     INSERT INTO agent_events (session_id, turn_id, source, type, role, summary, text, payload, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(sessionId, turnId, source, type, role, summary, text, JSON.stringify(payload || {}), now());
-  db.prepare('UPDATE agent_sessions SET updated_at = ? WHERE id = ?').run(now(), sessionId);
+  `).run(
+    sessionId,
+    turnId ?? null,
+    dbText(source, 'server'),
+    dbText(type, 'event'),
+    role ?? null,
+    summary ?? null,
+    dbText(text, ''),
+    safeStringify(payload),
+    createdAt
+  );
+  db.prepare('UPDATE agent_sessions SET updated_at = ? WHERE id = ?').run(createdAt, sessionId);
 }
 
 function listAgentApprovals(sessionId) {
@@ -744,12 +757,52 @@ function resolveAgentApproval(id, decision) {
   db.prepare('UPDATE agent_approvals SET status = ?, decision = ?, resolved_at = ? WHERE id = ?').run('resolved', decision, now(), id);
 }
 
+function markAgentSessionLost(sessionId, message = 'Agent runtime is no longer active') {
+  const session = getAgentSession(sessionId);
+  if (!session) return;
+  const at = now();
+  db.prepare(`
+    UPDATE agent_turns
+    SET status = 'failed', error = COALESCE(error, ?), completed_at = COALESCE(completed_at, ?)
+    WHERE session_id = ? AND status IN ('queued', 'running')
+  `).run(message, at, sessionId);
+  db.prepare('UPDATE agent_sessions SET status = ?, updated_at = ? WHERE id = ?').run('failed', at, sessionId);
+}
+
+function markInterruptedAgentRuns() {
+  const message = 'Server restarted before this Agent turn completed.';
+  const at = now();
+  db.prepare(`
+    UPDATE agent_turns
+    SET status = 'failed', error = COALESCE(error, ?), completed_at = COALESCE(completed_at, ?)
+    WHERE status IN ('queued', 'running')
+  `).run(message, at);
+  db.prepare(`
+    UPDATE agent_sessions
+    SET status = 'failed', updated_at = ?
+    WHERE status = 'running'
+  `).run(at);
+}
+
 function parsePayload(row) {
   if (!row?.payload || typeof row.payload !== 'string') return row;
   try {
     return { ...row, payload: JSON.parse(row.payload) };
   } catch {
     return { ...row, payload: {} };
+  }
+}
+
+function dbText(value, fallback) {
+  if (value == null) return fallback;
+  return Buffer.isBuffer(value) ? value.toString('utf8') : String(value);
+}
+
+function safeStringify(value) {
+  try {
+    return JSON.stringify(value ?? {});
+  } catch {
+    return '{}';
   }
 }
 

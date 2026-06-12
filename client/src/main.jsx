@@ -111,7 +111,7 @@ function App() {
       <Sidebar view={view} setView={setView} status={status} />
       <main className="main">
         <Topbar activeProfile={activeProfile} profiles={profiles} onProfileChange={setSelectedProfileId} onRefresh={refresh} error={error} />
-        {view === 'dashboard' && <Dashboard status={status} tasks={tasks} history={history} onOpenTask={(id) => { setSelectedTaskId(id); setView('sessions'); }} />}
+        {view === 'dashboard' && <Dashboard status={status} tasks={tasks} history={history} onOpenTask={(id) => { setSelectedTaskId(id); setView('sessions'); }} onNavigate={setView} />}
         {view === 'agent-chat' && <AgentChatBeta profiles={profiles} activeProfile={activeProfile} />}
         {view === 'workbench' && <Workbench profiles={profiles} activeProfile={activeProfile} tasks={tasks} selectedTask={selectedTask} setSelectedTaskId={setSelectedTaskId} onRefresh={refresh} />}
         {view === 'sessions' && <Sessions tasks={tasks} selectedTask={selectedTask} setSelectedTaskId={setSelectedTaskId} />}
@@ -142,7 +142,7 @@ function Sidebar({ view, setView, status }) {
         <Progress label="内存" value={status?.memory?.percent || 0} color={metricColors.memory} />
         <Progress label="磁盘" value={status?.disk?.percent || 0} color={metricColors.disk} />
       </div>
-      <button className="quick-connect"><Terminal size={18} />快速连接</button>
+      <button className="quick-connect" onClick={() => setView('terminal')}><Terminal size={18} />快速连接</button>
     </aside>
   );
 }
@@ -150,21 +150,21 @@ function Sidebar({ view, setView, status }) {
 function Topbar({ activeProfile, profiles, onProfileChange, onRefresh, error }) {
   return (
     <header className="topbar">
-      <div className="env-select"><Server size={18} />主服务器 · production <ChevronDown size={14} /></div>
-      <div className="search"><Search size={16} /><input placeholder="搜索项目、会话、Agent 或命令..." /><kbd>⌘ K</kbd></div>
+      <div className="env-select muted-action" title="当前仅配置一台服务器"><Server size={18} />主服务器 · production <ChevronDown size={14} /></div>
+      <div className="search muted-action" title="搜索暂未接入"><Search size={16} /><input disabled placeholder="搜索项目、会话、Agent 或命令..." /><kbd>⌘ K</kbd></div>
       <select value={activeProfile?.id || ''} onChange={(e) => onProfileChange(e.target.value)} className="profile-select">
         {profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
       </select>
       <button className="icon-btn" onClick={onRefresh} title="刷新"><RotateCw size={18} /></button>
-      <button className="icon-btn" title="通知"><Bell size={18} /></button>
-      <button className="icon-btn" title="帮助"><CircleHelp size={18} /></button>
-      <div className="avatar"><UserRound size={18} /></div>
+      <button className="icon-btn" disabled title="通知暂未接入"><Bell size={18} /></button>
+      <button className="icon-btn" disabled title="帮助暂未接入"><CircleHelp size={18} /></button>
+      <div className="avatar muted-action" title="账号菜单暂未接入"><UserRound size={18} /></div>
       {error && <div className="toast">{error}</div>}
     </header>
   );
 }
 
-function Dashboard({ status, tasks, history, onOpenTask }) {
+function Dashboard({ status, tasks, history, onOpenTask, onNavigate }) {
   const running = tasks.filter((task) => task.status === 'running').length;
   const succeeded = tasks.filter((task) => task.status === 'succeeded').length;
   return (
@@ -179,10 +179,10 @@ function Dashboard({ status, tasks, history, onOpenTask }) {
         <Metric title="网络" value={bytes(status?.network?.rx || 0)} detail="累计接收" icon={Network} color={metricColors.network} data={history.map((h) => ({ value: h.network }))} />
       </div>
       <div className="dashboard-grid">
-        <Panel className="span-2" title="最近会话" action="查看全部">
+        <Panel className="span-2" title="最近会话" action={<button className="link-btn" onClick={() => onNavigate('sessions')}>查看全部</button>}>
           <TaskTable tasks={tasks.slice(0, 6)} onOpenTask={onOpenTask} />
         </Panel>
-        <QuickActions />
+        <QuickActions onNavigate={onNavigate} />
         <ServiceSummary status={status} />
         <ResourcePanel history={history} />
         <Timeline tasks={tasks} />
@@ -202,6 +202,8 @@ function AgentChatBeta({ profiles, activeProfile }) {
   const [title, setTitle] = useState('');
   const [debug, setDebug] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [localError, setLocalError] = useState('');
+  const [socketState, setSocketState] = useState('idle');
   const socketRef = useRef(null);
 
   async function loadSessions() {
@@ -214,23 +216,30 @@ function AgentChatBeta({ profiles, activeProfile }) {
     if (!id) return;
     const data = await api(`/api/agent-sessions/${id}`);
     setSnapshot(data);
+    setLocalError('');
   }
 
   useEffect(() => {
-    loadSessions().catch(() => {});
+    loadSessions().catch((error) => setLocalError(error.message));
   }, []);
 
   useEffect(() => {
     if (!selectedId) return undefined;
-    loadSession(selectedId).catch(() => {});
+    loadSession(selectedId).catch((error) => setLocalError(error.message));
     const url = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/agent-sessions/${selectedId}`;
     const socket = new WebSocket(url);
     socketRef.current = socket;
+    setSocketState('connecting');
+    socket.onopen = () => setSocketState('connected');
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
       if (data.type === 'snapshot') setSnapshot(data);
     };
-    socket.onclose = () => { if (socketRef.current === socket) socketRef.current = null; };
+    socket.onerror = () => setLocalError('实时连接暂时不可用，页面会继续保留当前快照。');
+    socket.onclose = () => {
+      if (socketRef.current === socket) socketRef.current = null;
+      setSocketState('disconnected');
+    };
     return () => socket.close();
   }, [selectedId]);
 
@@ -250,6 +259,9 @@ function AgentChatBeta({ profiles, activeProfile }) {
       setTitle('');
       setSelectedId(data.session.id);
       await loadSessions();
+      setLocalError('');
+    } catch (error) {
+      setLocalError(error.message);
     } finally {
       setBusy(false);
     }
@@ -259,33 +271,61 @@ function AgentChatBeta({ profiles, activeProfile }) {
     event.preventDefault();
     if (!selectedId || !message.trim()) return;
     const body = message;
-    setMessage('');
-    await api(`/api/agent-sessions/${selectedId}/turns`, { method: 'POST', body: JSON.stringify({ message: body }) });
-    await loadSessions();
+    try {
+      await api(`/api/agent-sessions/${selectedId}/turns`, { method: 'POST', body: JSON.stringify({ message: body }) });
+      setMessage('');
+      setLocalError('');
+      await loadSessions();
+    } catch (error) {
+      setLocalError(error.message);
+    }
   }
 
   async function steer(event) {
     event.preventDefault();
     if (!selectedId || !steerText.trim()) return;
     const body = steerText;
-    setSteerText('');
-    await api(`/api/agent-sessions/${selectedId}/steer`, { method: 'POST', body: JSON.stringify({ message: body }) });
+    try {
+      const result = await api(`/api/agent-sessions/${selectedId}/steer`, { method: 'POST', body: JSON.stringify({ message: body }) });
+      if (result.ok === false) throw new Error(result.message || '补充说明没有发送成功');
+      setSteerText('');
+      setLocalError('');
+      await loadSession(selectedId);
+    } catch (error) {
+      setLocalError(error.message);
+    }
   }
 
   async function interrupt() {
     if (!selectedId) return;
-    await api(`/api/agent-sessions/${selectedId}/interrupt`, { method: 'POST', body: '{}' });
+    try {
+      const result = await api(`/api/agent-sessions/${selectedId}/interrupt`, { method: 'POST', body: '{}' });
+      if (result.ok === false) throw new Error(result.message || '打断没有发送成功');
+      setLocalError('');
+      await loadSession(selectedId);
+    } catch (error) {
+      setLocalError(error.message);
+    }
   }
 
   async function resolveApproval(approvalId, decision) {
-    await api(`/api/agent-sessions/${selectedId}/approvals/${approvalId}`, { method: 'POST', body: JSON.stringify({ decision }) });
+    try {
+      const result = await api(`/api/agent-sessions/${selectedId}/approvals/${approvalId}`, { method: 'POST', body: JSON.stringify({ decision }) });
+      if (result.ok === false) throw new Error(result.message || '确认操作没有发送成功');
+      setLocalError('');
+      await loadSession(selectedId);
+    } catch (error) {
+      setLocalError(error.message);
+    }
   }
 
   const session = snapshot?.session || sessions.find((item) => item.id === selectedId);
   const events = snapshot?.events || [];
   const turns = snapshot?.turns || [];
   const approvals = snapshot?.approvals || [];
-  const running = session?.status === 'running';
+  const activeTurn = turns.find((turn) => ['queued', 'running'].includes(turn.status));
+  const running = session?.status === 'running' && Boolean(activeTurn);
+  const statusText = session ? `${agentName(session.agent)} · ${session.status} · ${socketState}` : `未选择会话 · ${socketState}`;
 
   return (
     <section className="page agent-chat-page">
@@ -316,6 +356,11 @@ function AgentChatBeta({ profiles, activeProfile }) {
         </Panel>
 
         <Panel className="chat-main-panel" title={session?.title || '选择或新建一个会话'} action={<span className="badge">{session ? agentName(session.agent) : 'Beta'}</span>}>
+          <div className="chat-status-row">
+            <span className={`badge ${running ? 'ok' : session?.status === 'failed' ? 'danger' : 'warn'}`}>{statusText}</span>
+            {session?.status === 'failed' && <span className="muted">上一次运行已结束或服务重启后失效，可以直接重新发送。</span>}
+          </div>
+          {localError && <div className="local-error">{localError}</div>}
           <div className="chat-thread">
             {turns.map((turn) => (
               <React.Fragment key={turn.id}>
@@ -711,7 +756,7 @@ function eventsForTurn(events, turnId) {
 }
 
 function isConversationEvent(event) {
-  return ['agent.delta', 'agent.message', 'reasoning.summary', 'plan.update', 'error'].includes(event.type);
+  return ['agent.delta', 'agent.message'].includes(event.type) && !looksLikeHtml(event.text || event.summary || '');
 }
 
 function summarizeEvents(events) {
@@ -747,16 +792,19 @@ function eventLabel(type = '') {
   return labels[type] || type || '事件';
 }
 
-function QuickActions() {
+function QuickActions({ onNavigate }) {
   const actions = [
-    [Plus, '新建会话', '创建一个新的 Agent 会话'],
-    [Folder, '打开工作区', '浏览并打开项目工作区'],
-    [Terminal, '启动终端', '打开新的终端会话'],
-    [FileText, '查看日志', '查看系统与应用日志']
+    [Plus, '新建会话', '创建一个新的 Agent 会话', 'agent-chat'],
+    [Terminal, '启动终端', '打开新的终端会话', 'terminal'],
+    [FileText, '查看日志', '查看系统与应用日志', 'logs']
   ];
   return (
     <Panel title="快捷操作">
-      <div className="quick-grid">{actions.map(([Icon, title, text]) => <button className="quick-card" key={title}><Icon /> <strong>{title}</strong><small>{text}</small></button>)}</div>
+      <div className="quick-grid">{actions.map(([Icon, title, text, target]) => (
+        <button className="quick-card" key={title} onClick={() => onNavigate(target)}>
+          <Icon /> <strong>{title}</strong><small>{text}</small>
+        </button>
+      ))}</div>
     </Panel>
   );
 }
@@ -901,8 +949,23 @@ function Progress({ label, value, color }) {
 
 async function api(path, options) {
   const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
+  const text = await res.text();
+  if (!res.ok) throw new Error(friendlyHttpError(res.status, text));
+  return text ? JSON.parse(text) : {};
+}
+
+function friendlyHttpError(status, text) {
+  try {
+    const data = JSON.parse(text);
+    if (data?.error) return data.error;
+    if (data?.message) return data.message;
+  } catch {}
+  if (looksLikeHtml(text)) return `后端服务暂时不可用（HTTP ${status}），请稍后重试。`;
+  return text || `请求失败（HTTP ${status}）`;
+}
+
+function looksLikeHtml(value) {
+  return /<html[\s>]|<body[\s>]|<center>|\b502 Bad Gateway\b/i.test(String(value || ''));
 }
 
 function buildHistory(items, status) {

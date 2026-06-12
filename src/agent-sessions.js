@@ -72,7 +72,7 @@ export function registerAgentSessionRoutes(app, context) {
     const turn = context.createAgentTurn(session.id, message);
     manager.startTurn(session.id, turn.id, message).catch((error) => {
       context.failAgentTurn(turn.id, error);
-      context.appendAgentEvent({ sessionId: session.id, turnId: turn.id, source: 'server', type: 'error', text: error.message, payload: errorPayload(error) });
+      manager.safeAppendEvent({ sessionId: session.id, turnId: turn.id, source: 'server', type: 'error', text: error.message, payload: errorPayload(error) });
       manager.broadcast(session.id);
     });
     return reply.code(201).send({ turn });
@@ -153,7 +153,7 @@ class AgentRuntimeManager {
   async startCodexTurn(session, turnId, message) {
     const runtime = await this.ensureCodexRuntime(session);
     this.context.startAgentTurn(turnId);
-    this.context.appendAgentEvent({ sessionId: session.id, turnId, source: 'user', type: 'user.message', role: 'user', text: message });
+    this.safeAppendEvent({ sessionId: session.id, turnId, source: 'user', type: 'user.message', role: 'user', text: message });
     this.broadcast(session.id);
     let threadId = session.threadId;
     if (!threadId) {
@@ -176,8 +176,8 @@ class AgentRuntimeManager {
   startClaudeTurn(session, turnId, message) {
     const profile = this.context.getProfile(session.profileId) || this.context.defaultProfile();
     this.context.startAgentTurn(turnId);
-    this.context.appendAgentEvent({ sessionId: session.id, turnId, source: 'user', type: 'user.message', role: 'user', text: message });
-    this.context.appendAgentEvent({ sessionId: session.id, turnId, source: 'claude', type: 'turn.started', text: 'Claude turn started' });
+    this.safeAppendEvent({ sessionId: session.id, turnId, source: 'user', type: 'user.message', role: 'user', text: message });
+    this.safeAppendEvent({ sessionId: session.id, turnId, source: 'claude', type: 'turn.started', text: 'Claude turn started' });
     this.broadcast(session.id);
     const child = spawn('claude-deepseek', ['-p', message], {
       cwd: session.cwd,
@@ -188,24 +188,24 @@ class AgentRuntimeManager {
     this.claude.set(session.id, { child, turnId });
     child.stdout.on('data', (chunk) => {
       const text = trim(chunk);
-      this.context.appendAgentEvent({ sessionId: session.id, turnId, source: 'claude', type: 'agent.delta', role: 'assistant', text });
+      this.safeAppendEvent({ sessionId: session.id, turnId, source: 'claude', type: 'agent.delta', role: 'assistant', text });
       this.broadcast(session.id);
     });
     child.stderr.on('data', (chunk) => {
       const text = trim(chunk);
-      this.context.appendAgentEvent({ sessionId: session.id, turnId, source: 'claude', type: 'log.stderr', text });
+      this.safeAppendEvent({ sessionId: session.id, turnId, source: 'claude', type: 'log.stderr', text });
       this.broadcast(session.id);
     });
     child.on('error', (error) => {
       this.context.failAgentTurn(turnId, error);
-      this.context.appendAgentEvent({ sessionId: session.id, turnId, source: 'claude', type: 'error', text: error.message, payload: errorPayload(error) });
+      this.safeAppendEvent({ sessionId: session.id, turnId, source: 'claude', type: 'error', text: error.message, payload: errorPayload(error) });
       this.claude.delete(session.id);
       this.broadcast(session.id);
     });
     child.on('close', (code, signal) => {
       const status = signal ? 'cancelled' : code === 0 ? 'succeeded' : 'failed';
       this.context.completeAgentTurn(turnId, status);
-      this.context.appendAgentEvent({ sessionId: session.id, turnId, source: 'claude', type: 'turn.completed', text: status, payload: { code, signal } });
+      this.safeAppendEvent({ sessionId: session.id, turnId, source: 'claude', type: 'turn.completed', text: status, payload: { code, signal } });
       this.claude.delete(session.id);
       this.broadcast(session.id);
     });
@@ -215,18 +215,18 @@ class AgentRuntimeManager {
     const session = this.context.getAgentSession(sessionId);
     if (!session) throw new Error('session not found');
     if (session.agent !== 'codex') {
-      this.context.appendAgentEvent({ sessionId, source: 'server', type: 'capability.unavailable', text: 'Claude Code does not support realtime steer; send a new turn instead.' });
+      this.safeAppendEvent({ sessionId, source: 'server', type: 'capability.unavailable', text: 'Claude Code does not support realtime steer; send a new turn instead.' });
       this.broadcast(sessionId);
       return { ok: false, supported: false, message: 'Claude Code does not support realtime steer' };
     }
     const runtime = this.codex.get(sessionId);
-    if (!runtime) return { ok: false, supported: true, message: 'No active Codex runtime' };
-    if (!runtime.activeTurnId) return { ok: false, supported: true, message: 'No active Codex turn' };
+    if (!runtime) return this.markLost(sessionId, 'No active Codex runtime');
+    if (!runtime.activeTurnId) return this.markLost(sessionId, 'No active Codex turn');
     const threadId = session.threadId || runtime.threadId;
     const expectedTurnId = runtime.activeCodexTurnId;
     if (!threadId || !expectedTurnId) return { ok: false, supported: true, message: 'Codex turn is not ready for steer yet' };
     await runtime.request('turn/steer', { threadId, expectedTurnId, input: [{ type: 'text', text: message }] });
-    this.context.appendAgentEvent({ sessionId, turnId: runtime.activeTurnId, source: 'user', type: 'user.steer', role: 'user', text: message });
+    this.safeAppendEvent({ sessionId, turnId: runtime.activeTurnId, source: 'user', type: 'user.steer', role: 'user', text: message });
     this.broadcast(sessionId);
     return { ok: true };
   }
@@ -236,24 +236,24 @@ class AgentRuntimeManager {
     if (!session) throw new Error('session not found');
     if (session.agent === 'codex') {
       const runtime = this.codex.get(sessionId);
-      if (!runtime) return { ok: false, message: 'No active Codex runtime' };
-      if (!runtime.activeTurnId) return { ok: false, message: 'No active Codex turn' };
+      if (!runtime) return this.markLost(sessionId, 'No active Codex runtime');
+      if (!runtime.activeTurnId) return this.markLost(sessionId, 'No active Codex turn');
       const threadId = session.threadId || runtime.threadId;
       const turnId = runtime.activeCodexTurnId;
       if (!threadId || !turnId) return { ok: false, message: 'Codex turn is not ready for interrupt yet' };
       await runtime.request('turn/interrupt', { threadId, turnId });
-      this.context.appendAgentEvent({ sessionId, turnId: runtime.activeTurnId, source: 'user', type: 'turn.interrupt.requested', text: 'Interrupt requested' });
+      this.safeAppendEvent({ sessionId, turnId: runtime.activeTurnId, source: 'user', type: 'turn.interrupt.requested', text: 'Interrupt requested' });
       this.broadcast(sessionId);
       return { ok: true };
     }
     const runtime = this.claude.get(sessionId);
-    if (!runtime) return { ok: false, message: 'No active Claude process' };
+    if (!runtime) return this.markLost(sessionId, 'No active Claude process');
     try {
       process.kill(-runtime.child.pid, 'SIGTERM');
     } catch {
       try { runtime.child.kill('SIGTERM'); } catch {}
     }
-    this.context.appendAgentEvent({ sessionId, turnId: runtime.turnId, source: 'user', type: 'turn.interrupt.requested', text: 'Cancel requested' });
+    this.safeAppendEvent({ sessionId, turnId: runtime.turnId, source: 'user', type: 'turn.interrupt.requested', text: 'Cancel requested' });
     this.broadcast(sessionId);
     return { ok: true };
   }
@@ -271,7 +271,7 @@ class AgentRuntimeManager {
     const rpcRequestId = payload.rpcRequestId || raw.id;
     if (!rpcRequestId) return { ok: false, message: 'Approval request is missing an RPC id' };
     runtime.respond(rpcRequestId, approvalResponse(raw.method, decision));
-    this.context.appendAgentEvent({ sessionId, turnId: runtime.activeTurnId, source: 'user', type: 'approval.resolved', text: decision, payload: { approvalId, decision } });
+    this.safeAppendEvent({ sessionId, turnId: runtime.activeTurnId, source: 'user', type: 'approval.resolved', text: decision, payload: { approvalId, decision } });
     this.broadcast(sessionId);
     return { ok: true };
   }
@@ -287,29 +287,50 @@ class AgentRuntimeManager {
   }
 
   handleCodexNotification(sessionId, msg) {
-    const session = this.context.getAgentSession(sessionId);
-    if (!session) return;
-    const runtime = this.codex.get(sessionId);
-    const turnId = runtime?.activeTurnId || null;
-    const normalized = normalizeCodexNotification(msg);
-    if (normalized.approval) {
-      const approval = this.context.createAgentApproval({ sessionId, turnId, payload: { rpcRequestId: msg.id, raw: normalized.raw } });
-      normalized.event.payload = { ...normalized.event.payload, approvalId: approval.id };
-    }
-    this.context.appendAgentEvent({ sessionId, turnId, ...normalized.event });
-    if (normalized.threadId) {
-      runtime.threadId = normalized.threadId;
-      this.context.setAgentThread(sessionId, normalized.threadId);
-    }
-    if (normalized.codexTurnId) runtime.activeCodexTurnId = normalized.codexTurnId;
-    if (normalized.turnStatus) {
-      this.context.completeAgentTurn(turnId, normalized.turnStatus);
-      if (runtime) {
-        runtime.activeTurnId = null;
-        runtime.activeCodexTurnId = null;
+    try {
+      const session = this.context.getAgentSession(sessionId);
+      if (!session) return;
+      const runtime = this.codex.get(sessionId);
+      const turnId = runtime?.activeTurnId || null;
+      const normalized = normalizeCodexNotification(msg);
+      if (normalized.approval) {
+        const approval = this.context.createAgentApproval({ sessionId, turnId, payload: { rpcRequestId: msg.id, raw: normalized.raw } });
+        normalized.event.payload = { ...normalized.event.payload, approvalId: approval.id };
       }
+      this.safeAppendEvent({ sessionId, turnId, ...normalized.event });
+      if (normalized.threadId) {
+        runtime.threadId = normalized.threadId;
+        this.context.setAgentThread(sessionId, normalized.threadId);
+      }
+      if (normalized.codexTurnId) runtime.activeCodexTurnId = normalized.codexTurnId;
+      if (normalized.turnStatus) {
+        this.context.completeAgentTurn(turnId, normalized.turnStatus);
+        if (runtime) {
+          runtime.activeTurnId = null;
+          runtime.activeCodexTurnId = null;
+        }
+      }
+      this.broadcast(sessionId);
+    } catch (error) {
+      console.error('failed to handle codex notification', error);
+      this.safeAppendEvent({ sessionId, source: 'server', type: 'error', text: `Failed to process Codex event: ${error.message}`, payload: errorPayload(error) });
+      this.broadcast(sessionId);
     }
+  }
+
+  safeAppendEvent(event) {
+    try {
+      this.context.appendAgentEvent(event);
+    } catch (error) {
+      console.error('failed to append agent event', error, event);
+    }
+  }
+
+  markLost(sessionId, message) {
+    this.context.markAgentSessionLost(sessionId, message);
+    this.safeAppendEvent({ sessionId, source: 'server', type: 'runtime.lost', text: message });
     this.broadcast(sessionId);
+    return { ok: false, message };
   }
 
   shutdownAll() {
@@ -438,7 +459,7 @@ function normalizeCodexNotification(msg) {
     approval = true;
   } else if (method === 'turn/completed' || method === 'turn.completed') {
     type = 'turn.completed';
-    turnStatus = 'succeeded';
+    turnStatus = codexTurnStatus(params.turn?.status || params.status);
     codexTurnId = params.turn?.id || codexTurnId;
   } else if (method === 'turn/failed' || method === 'turn.failed' || method === 'error') {
     type = 'error';
@@ -446,6 +467,7 @@ function normalizeCodexNotification(msg) {
   } else if (method === 'server/closed') {
     type = 'runtime.closed';
     source = 'server';
+    turnStatus = params.code === 0 ? null : 'failed';
   } else if (method === 'server/stderr' || method === 'server/raw') {
     type = 'log.stderr';
     source = 'server';
@@ -459,6 +481,13 @@ function normalizeCodexNotification(msg) {
     codexTurnId,
     turnStatus,
   };
+}
+
+function codexTurnStatus(value) {
+  const status = String(value || '').toLowerCase();
+  if (['failed', 'error'].includes(status)) return 'failed';
+  if (['cancelled', 'canceled', 'interrupted'].includes(status)) return 'cancelled';
+  return 'succeeded';
 }
 
 function approvalResponse(method = '', decision) {

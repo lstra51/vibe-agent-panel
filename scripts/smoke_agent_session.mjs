@@ -3,7 +3,12 @@ import WebSocket from 'ws';
 const base = process.env.VIBE_BASE_URL || 'http://127.0.0.1:3000';
 const wsBase = base.replace(/^http/, 'ws');
 const agent = process.env.VIBE_SMOKE_AGENT || 'codex';
-const message = process.env.VIBE_SMOKE_MESSAGE || 'Reply with exactly: agent beta ok';
+const defaultMessages = {
+  codex: '请用一句话说明这台服务器现在最适合用来做什么？',
+  claude: '请用一句话回复：DeepSeek 通道正常。',
+};
+const message = process.env.VIBE_SMOKE_MESSAGE || defaultMessages[agent] || defaultMessages.codex;
+const expectedText = process.env.VIBE_EXPECT_TEXT || (agent === 'claude' ? 'DeepSeek' : '');
 
 async function api(path, options = {}) {
   const res = await fetch(`${base}${path}`, {
@@ -72,4 +77,16 @@ if (!activeTurn || activeTurn.status !== 'succeeded') {
 
 if (agent === 'codex' && final.events.length < 2) {
   throw new Error('codex event stream was too small');
+}
+
+if (!text.trim()) {
+  throw new Error('agent response was empty');
+}
+
+if (/<html[\s>]|<body[\s>]|502 Bad Gateway/i.test(text)) {
+  throw new Error('agent output included an HTML error page');
+}
+
+if (expectedText && !text.includes(expectedText)) {
+  throw new Error(`agent output did not include expected text: ${expectedText}`);
 }
