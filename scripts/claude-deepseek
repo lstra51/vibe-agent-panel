@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/opt/vibe-coding/litellm/litellm.env"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+PROFILE_ROOT="${VIBE_PROFILES_ROOT:-/opt/vibe-coding/profiles}"
+PROFILE_ID="${VIBE_PROFILE_ID:-}"
+PROFILE_FILE=""
+if [ -n "$PROFILE_ID" ] && [ -f "$PROFILE_ROOT/$PROFILE_ID/deepseek.json" ]; then
+  PROFILE_FILE="$PROFILE_ROOT/$PROFILE_ID/deepseek.json"
+fi
+
+if [ -n "$PROFILE_FILE" ]; then
+  PROFILE_EXPORTS="$(python3 - "$PROFILE_FILE" <<'PY'
+import json, shlex, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+print("ANTHROPIC_AUTH_TOKEN=" + shlex.quote(data.get("anthropicToken", "")))
+print("ANTHROPIC_MODEL=" + shlex.quote(data.get("model", "deepseek-chat")))
+PY
+)"
+  eval "$PROFILE_EXPORTS"
+else
+  if [ "${DEEPSEEK_API_KEY:-__FILL_DEEPSEEK_API_KEY__}" = "__FILL_DEEPSEEK_API_KEY__" ]; then
+    echo "DeepSeek API key is not configured. Configure a Vibe Profile or edit /opt/vibe-coding/litellm/litellm.env first." >&2
+    exit 2
+  fi
+  ANTHROPIC_AUTH_TOKEN="${LITELLM_MASTER_KEY:-}"
+  ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-deepseek-chat}"
+fi
+
+export PATH="/home/ubuntu/.local/npm/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+export ANTHROPIC_BASE_URL="http://127.0.0.1:4100"
+export ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_MODEL
+
+CLAUDE_BIN="/home/ubuntu/.local/npm/bin/claude"
+if [ ! -x "$CLAUDE_BIN" ]; then
+  CLAUDE_BIN="$(command -v claude || true)"
+fi
+if [ -z "$CLAUDE_BIN" ]; then
+  echo "Claude Code CLI not found. Expected /home/ubuntu/.local/npm/bin/claude." >&2
+  exit 127
+fi
+
+exec "$CLAUDE_BIN" "$@"

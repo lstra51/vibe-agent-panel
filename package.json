@@ -1,0 +1,31 @@
+{
+  "name": "vibe-agent-panel",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "@fastify/static": "latest",
+    "@fastify/websocket": "latest",
+    "@xterm/addon-fit": "latest",
+    "@xterm/xterm": "latest",
+    "better-sqlite3": "latest",
+    "fastify": "latest",
+    "lucide-react": "latest",
+    "nanoid": "latest",
+    "node-pty": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "recharts": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "latest",
+    "playwright": "^1.60.0",
+    "vite": "latest"
+  }
+}
