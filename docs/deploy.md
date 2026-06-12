@@ -6,7 +6,7 @@ This project is designed to run on an Ubuntu server behind Nginx.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y nodejs npm python3 make g++ nginx
+sudo apt-get install -y nodejs npm python3 make g++ nginx bubblewrap
 ```
 
 The production server used during initial setup had:
@@ -43,7 +43,19 @@ sudo install -m 644 scripts/anthropic_deepseek_shim.py /opt/vibe-coding/anthropi
 
 The shim expects `fastapi`, `uvicorn`, and `httpx` in the Python environment used by the `anthropic-deepseek.service`.
 
-## 4. systemd Service
+## 4. Agent Chat Beta
+
+The Agent Chat Beta workbench adds a Codex-native conversation path beside the legacy task runner:
+
+- Codex sessions use `codex app-server --stdio`.
+- Claude sessions use `claude-deepseek -p` and the local Anthropic-to-DeepSeek shim.
+- Session state is stored in SQLite tables `agent_sessions`, `agent_turns`, `agent_events`, and `agent_approvals`.
+- WebSocket updates are available at `/ws/agent-sessions/:id`.
+- REST endpoints are under `/api/agent-sessions`.
+
+Codex profiles are isolated under `/opt/vibe-coding/profiles/<profile>/codex`. On startup, the default profile imports an existing `/home/ubuntu/.codex/auth.json` once if the profile has no auth file yet. Do not commit auth files, DeepSeek keys, subscriptions, or web passwords.
+
+## 5. systemd Service
 
 Create `/etc/systemd/system/vibe-coding.service`:
 
@@ -81,9 +93,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now vibe-coding
 ```
 
-## 5. Nginx Notes
+## 6. Nginx Notes
 
-Nginx must support WebSocket upgrade for task streams and terminals:
+Nginx must support WebSocket upgrade for task streams, terminals, and Agent Chat Beta sessions:
 
 ```nginx
 proxy_http_version 1.1;
@@ -95,14 +107,18 @@ proxy_send_timeout 3600s;
 
 Keep Basic Auth or another access control layer enabled before exposing the panel.
 
-## 6. Smoke Checks
+## 7. Smoke Checks
 
 ```bash
 curl -fsS http://127.0.0.1:3000/api/status
 curl -fsS http://127.0.0.1:3000/api/profiles
 python3 scripts/smoke_task.py
 python3 scripts/smoke_codex_login.py
+VIBE_SMOKE_AGENT=claude node scripts/smoke_agent_session.mjs
+VIBE_SMOKE_AGENT=codex node scripts/smoke_agent_session.mjs
+node scripts/smoke_agent_control.mjs
 ```
 
 The smoke task requires a configured DeepSeek key in the default Vibe Profile.
 The Codex login smoke test only verifies that the device-auth flow starts; it does not complete account login.
+The Agent Chat smoke checks verify Claude/DeepSeek output, Codex app-server event streaming, WebSocket snapshots, realtime steer, and interrupt.

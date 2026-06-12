@@ -4,10 +4,11 @@ import fastifyWebsocket from '@fastify/websocket';
 import Database from 'better-sqlite3';
 import { nanoid } from 'nanoid';
 import { spawn, execFile } from 'node:child_process';
-import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, chmodSync } from 'node:fs';
+import { copyFileSync, createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, chmodSync } from 'node:fs';
 import { dirname, join, resolve, relative } from 'node:path';
 import { cpus, loadavg, hostname, platform, release, uptime } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { registerAgentSessionRoutes } from './agent-sessions.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = resolve(__dirname, '..');
@@ -37,6 +38,7 @@ const loginSessions = new Map();
 const app = Fastify({ logger: true, bodyLimit: 1024 * 1024 });
 await app.register(fastifyWebsocket);
 await app.register(fastifyStatic, { root: join(APP_ROOT, 'dist') });
+registerAgentSessionRoutes(app, agentContext());
 
 app.get('/api/status', async () => {
   const [memory, disk, services, versions, ports, network] = await Promise.all([
@@ -327,6 +329,49 @@ function migrate() {
       payload TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS agent_sessions (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      status TEXT NOT NULL,
+      thread_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS agent_turns (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      user_message TEXT NOT NULL,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS agent_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      turn_id TEXT,
+      source TEXT NOT NULL,
+      type TEXT NOT NULL,
+      role TEXT,
+      summary TEXT,
+      text TEXT,
+      payload TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS agent_approvals (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      turn_id TEXT,
+      status TEXT NOT NULL,
+      decision TEXT,
+      payload TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
   `);
   addColumn('tasks', 'profile_id', 'TEXT');
   addColumn('tasks', 'title', 'TEXT');
@@ -407,6 +452,7 @@ function ensureDefaultProfile() {
   const count = db.prepare('SELECT COUNT(*) AS count FROM profiles').get().count;
   if (count === 0) createProfile('default', 'Default', true);
   importLegacyDeepSeekKey();
+  importLegacyCodexAuth();
 }
 
 function defaultProfile() {
@@ -477,6 +523,25 @@ function parseEnvFile(path) {
   return out;
 }
 
+function importLegacyCodexAuth() {
+  const profile = getProfile('default') || defaultProfile();
+  if (!profile) return;
+  const codexHome = profile.codex_home || profile.codexHome;
+  const targetAuth = join(codexHome, 'auth.json');
+  const sourceAuth = join(HOME, '.codex', 'auth.json');
+  if (existsSync(targetAuth) || !existsSync(sourceAuth)) return;
+  mkdirSync(codexHome, { recursive: true });
+  copyFileSync(sourceAuth, targetAuth);
+  try { chmodSync(targetAuth, 0o600); } catch {}
+  const sourceConfig = join(HOME, '.codex', 'config.toml');
+  const targetConfig = join(codexHome, 'config.toml');
+  if (!existsSync(targetConfig) && existsSync(sourceConfig)) {
+    copyFileSync(sourceConfig, targetConfig);
+    try { chmodSync(targetConfig, 0o600); } catch {}
+  }
+  audit('profile.codex.imported_legacy', { profileId: profile.id, source: sourceAuth });
+}
+
 function profileEnv(profile) {
   const cfg = readJson(profileFile(profile.id, 'deepseek.json'), {});
   return {
@@ -516,6 +581,176 @@ function readJson(path, fallback) {
 
 function audit(type, payload) {
   db.prepare('INSERT INTO audit_events (type, payload, created_at) VALUES (?, ?, ?)').run(type, JSON.stringify(payload), now());
+}
+
+function agentContext() {
+  return {
+    PROJECTS_ROOT,
+    defaultProfile,
+    getProfile,
+    profileEnv,
+    safeProjectPath,
+    audit,
+    listAgentSessions,
+    createAgentSession,
+    getAgentSession,
+    setAgentThread,
+    listAgentTurns,
+    createAgentTurn,
+    startAgentTurn,
+    completeAgentTurn,
+    failAgentTurn,
+    listAgentEvents,
+    appendAgentEvent,
+    listAgentApprovals,
+    createAgentApproval,
+    getAgentApproval,
+    resolveAgentApproval,
+  };
+}
+
+function listAgentSessions(limit = 80) {
+  return db.prepare(`
+    SELECT id, agent, profile_id AS profileId, title, cwd, status, thread_id AS threadId,
+      created_at AS createdAt, updated_at AS updatedAt
+    FROM agent_sessions
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(limit);
+}
+
+function createAgentSession({ agent, profileId, title, cwd }) {
+  const id = `sess_${nanoid(12)}`;
+  db.prepare(`
+    INSERT INTO agent_sessions (id, agent, profile_id, title, cwd, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'idle', ?, ?)
+  `).run(id, agent, profileId, title, cwd, now(), now());
+  return getAgentSession(id);
+}
+
+function getAgentSession(id) {
+  return db.prepare(`
+    SELECT id, agent, profile_id AS profileId, title, cwd, status, thread_id AS threadId,
+      created_at AS createdAt, updated_at AS updatedAt
+    FROM agent_sessions
+    WHERE id = ?
+  `).get(id);
+}
+
+function setAgentThread(sessionId, threadId) {
+  db.prepare('UPDATE agent_sessions SET thread_id = ?, updated_at = ? WHERE id = ?').run(threadId, now(), sessionId);
+}
+
+function listAgentTurns(sessionId) {
+  return db.prepare(`
+    SELECT id, session_id AS sessionId, status, user_message AS userMessage, error,
+      created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt
+    FROM agent_turns
+    WHERE session_id = ?
+    ORDER BY created_at ASC
+  `).all(sessionId);
+}
+
+function createAgentTurn(sessionId, userMessage) {
+  const id = `turn_${nanoid(12)}`;
+  db.prepare(`
+    INSERT INTO agent_turns (id, session_id, status, user_message, created_at)
+    VALUES (?, ?, 'queued', ?, ?)
+  `).run(id, sessionId, userMessage, now());
+  db.prepare('UPDATE agent_sessions SET status = ?, updated_at = ? WHERE id = ?').run('running', now(), sessionId);
+  return getAgentTurn(id);
+}
+
+function getAgentTurn(id) {
+  return db.prepare(`
+    SELECT id, session_id AS sessionId, status, user_message AS userMessage, error,
+      created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt
+    FROM agent_turns
+    WHERE id = ?
+  `).get(id);
+}
+
+function startAgentTurn(turnId) {
+  const turn = getAgentTurn(turnId);
+  if (!turn) return;
+  db.prepare('UPDATE agent_turns SET status = ?, started_at = ? WHERE id = ?').run('running', now(), turnId);
+  db.prepare('UPDATE agent_sessions SET status = ?, updated_at = ? WHERE id = ?').run('running', now(), turn.sessionId);
+}
+
+function completeAgentTurn(turnId, status = 'succeeded') {
+  if (!turnId) return;
+  const turn = getAgentTurn(turnId);
+  if (!turn) return;
+  db.prepare('UPDATE agent_turns SET status = ?, completed_at = ? WHERE id = ?').run(status, now(), turnId);
+  db.prepare('UPDATE agent_sessions SET status = ?, updated_at = ? WHERE id = ?').run(status === 'succeeded' ? 'idle' : status, now(), turn.sessionId);
+}
+
+function failAgentTurn(turnId, error) {
+  if (!turnId) return;
+  const turn = getAgentTurn(turnId);
+  if (!turn) return;
+  db.prepare('UPDATE agent_turns SET status = ?, error = ?, completed_at = ? WHERE id = ?').run('failed', error.message, now(), turnId);
+  db.prepare('UPDATE agent_sessions SET status = ?, updated_at = ? WHERE id = ?').run('failed', now(), turn.sessionId);
+}
+
+function listAgentEvents(sessionId) {
+  return db.prepare(`
+    SELECT id, session_id AS sessionId, turn_id AS turnId, source, type, role, summary, text, payload,
+      created_at AS createdAt
+    FROM agent_events
+    WHERE session_id = ?
+    ORDER BY id ASC
+  `).all(sessionId).map(parsePayload);
+}
+
+function appendAgentEvent({ sessionId, turnId = null, source, type, role = null, summary = null, text = '', payload = {} }) {
+  db.prepare(`
+    INSERT INTO agent_events (session_id, turn_id, source, type, role, summary, text, payload, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(sessionId, turnId, source, type, role, summary, text, JSON.stringify(payload || {}), now());
+  db.prepare('UPDATE agent_sessions SET updated_at = ? WHERE id = ?').run(now(), sessionId);
+}
+
+function listAgentApprovals(sessionId) {
+  return db.prepare(`
+    SELECT id, session_id AS sessionId, turn_id AS turnId, status, decision, payload,
+      created_at AS createdAt, resolved_at AS resolvedAt
+    FROM agent_approvals
+    WHERE session_id = ?
+    ORDER BY created_at ASC
+  `).all(sessionId).map(parsePayload);
+}
+
+function createAgentApproval({ sessionId, turnId = null, payload = {} }) {
+  const id = `approval_${nanoid(12)}`;
+  db.prepare(`
+    INSERT INTO agent_approvals (id, session_id, turn_id, status, payload, created_at)
+    VALUES (?, ?, ?, 'pending', ?, ?)
+  `).run(id, sessionId, turnId, JSON.stringify(payload || {}), now());
+  return getAgentApproval(id);
+}
+
+function getAgentApproval(id) {
+  const row = db.prepare(`
+    SELECT id, session_id AS sessionId, turn_id AS turnId, status, decision, payload,
+      created_at AS createdAt, resolved_at AS resolvedAt
+    FROM agent_approvals
+    WHERE id = ?
+  `).get(id);
+  return row ? parsePayload(row) : null;
+}
+
+function resolveAgentApproval(id, decision) {
+  db.prepare('UPDATE agent_approvals SET status = ?, decision = ?, resolved_at = ? WHERE id = ?').run('resolved', decision, now(), id);
+}
+
+function parsePayload(row) {
+  if (!row?.payload || typeof row.payload !== 'string') return row;
+  try {
+    return { ...row, payload: JSON.parse(row.payload) };
+  } catch {
+    return { ...row, payload: {} };
+  }
 }
 
 async function memoryInfo() {

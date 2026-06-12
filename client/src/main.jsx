@@ -51,6 +51,7 @@ import {
 
 const navItems = [
   { id: 'dashboard', label: '仪表盘', icon: Home },
+  { id: 'agent-chat', label: 'Agent Chat Beta', icon: Zap },
   { id: 'workbench', label: 'Agent 工作台', icon: Bot },
   { id: 'sessions', label: '会话', icon: Activity },
   { id: 'monitor', label: '服务监控', icon: Monitor },
@@ -111,6 +112,7 @@ function App() {
       <main className="main">
         <Topbar activeProfile={activeProfile} profiles={profiles} onProfileChange={setSelectedProfileId} onRefresh={refresh} error={error} />
         {view === 'dashboard' && <Dashboard status={status} tasks={tasks} history={history} onOpenTask={(id) => { setSelectedTaskId(id); setView('sessions'); }} />}
+        {view === 'agent-chat' && <AgentChatBeta profiles={profiles} activeProfile={activeProfile} />}
         {view === 'workbench' && <Workbench profiles={profiles} activeProfile={activeProfile} tasks={tasks} selectedTask={selectedTask} setSelectedTaskId={setSelectedTaskId} onRefresh={refresh} />}
         {view === 'sessions' && <Sessions tasks={tasks} selectedTask={selectedTask} setSelectedTaskId={setSelectedTaskId} />}
         {view === 'monitor' && <MonitorPage status={status} history={history} />}
@@ -184,6 +186,166 @@ function Dashboard({ status, tasks, history, onOpenTask }) {
         <ServiceSummary status={status} />
         <ResourcePanel history={history} />
         <Timeline tasks={tasks} />
+      </div>
+    </section>
+  );
+}
+
+function AgentChatBeta({ profiles, activeProfile }) {
+  const [sessions, setSessions] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [snapshot, setSnapshot] = useState(null);
+  const [message, setMessage] = useState('');
+  const [steerText, setSteerText] = useState('');
+  const [agent, setAgent] = useState('codex');
+  const [cwd, setCwd] = useState('/home/ubuntu/projects');
+  const [title, setTitle] = useState('');
+  const [debug, setDebug] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const socketRef = useRef(null);
+
+  async function loadSessions() {
+    const data = await api('/api/agent-sessions?limit=120');
+    setSessions(data.sessions || []);
+    if (!selectedId && data.sessions?.[0]) setSelectedId(data.sessions[0].id);
+  }
+
+  async function loadSession(id) {
+    if (!id) return;
+    const data = await api(`/api/agent-sessions/${id}`);
+    setSnapshot(data);
+  }
+
+  useEffect(() => {
+    loadSessions().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) return undefined;
+    loadSession(selectedId).catch(() => {});
+    const url = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/agent-sessions/${selectedId}`;
+    const socket = new WebSocket(url);
+    socketRef.current = socket;
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === 'snapshot') setSnapshot(data);
+    };
+    socket.onclose = () => { if (socketRef.current === socket) socketRef.current = null; };
+    return () => socket.close();
+  }, [selectedId]);
+
+  async function createSession(event) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const data = await api('/api/agent-sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          agent,
+          profileId: activeProfile?.id,
+          cwd,
+          title: title || `${agentName(agent)} 会话`,
+        }),
+      });
+      setTitle('');
+      setSelectedId(data.session.id);
+      await loadSessions();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendTurn(event) {
+    event.preventDefault();
+    if (!selectedId || !message.trim()) return;
+    const body = message;
+    setMessage('');
+    await api(`/api/agent-sessions/${selectedId}/turns`, { method: 'POST', body: JSON.stringify({ message: body }) });
+    await loadSessions();
+  }
+
+  async function steer(event) {
+    event.preventDefault();
+    if (!selectedId || !steerText.trim()) return;
+    const body = steerText;
+    setSteerText('');
+    await api(`/api/agent-sessions/${selectedId}/steer`, { method: 'POST', body: JSON.stringify({ message: body }) });
+  }
+
+  async function interrupt() {
+    if (!selectedId) return;
+    await api(`/api/agent-sessions/${selectedId}/interrupt`, { method: 'POST', body: '{}' });
+  }
+
+  async function resolveApproval(approvalId, decision) {
+    await api(`/api/agent-sessions/${selectedId}/approvals/${approvalId}`, { method: 'POST', body: JSON.stringify({ decision }) });
+  }
+
+  const session = snapshot?.session || sessions.find((item) => item.id === selectedId);
+  const events = snapshot?.events || [];
+  const turns = snapshot?.turns || [];
+  const approvals = snapshot?.approvals || [];
+  const running = session?.status === 'running';
+
+  return (
+    <section className="page agent-chat-page">
+      <PageTitle title="Agent Chat Beta" subtitle="Codex app-server 深集成，多轮对话、实时事件、补充说明与打断" />
+      <div className="agent-chat-grid">
+        <Panel title="会话">
+          <form className="task-form compact-form" onSubmit={createSession}>
+            <select value={agent} onChange={(event) => setAgent(event.target.value)}>
+              <option value="codex">Codex</option>
+              <option value="claude">Claude Code</option>
+            </select>
+            <select value={activeProfile?.id || ''} disabled>
+              {profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+            </select>
+            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="会话标题" />
+            <input value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/home/ubuntu/projects" />
+            <button className="primary" disabled={busy || !activeProfile}><Plus size={16} />新建会话</button>
+          </form>
+          <div className="chat-session-list">
+            {sessions.map((item) => (
+              <button className={item.id === selectedId ? 'selected' : ''} key={item.id} onClick={() => setSelectedId(item.id)}>
+                <strong>{item.title}</strong>
+                <small>{agentName(item.agent)} · {item.status} · {relativeTime(item.updatedAt)}</small>
+              </button>
+            ))}
+            {!sessions.length && <p className="muted">暂无 Beta 会话</p>}
+          </div>
+        </Panel>
+
+        <Panel className="chat-main-panel" title={session?.title || '选择或新建一个会话'} action={<span className="badge">{session ? agentName(session.agent) : 'Beta'}</span>}>
+          <div className="chat-thread">
+            {turns.map((turn) => (
+              <React.Fragment key={turn.id}>
+                <ChatBubble role="user" text={turn.userMessage} meta={turn.status} />
+                {eventsForTurn(events, turn.id).filter((event) => isConversationEvent(event)).map((event) => (
+                  <ChatBubble key={event.id} role={event.role || 'assistant'} text={event.text || event.summary || event.type} meta={event.type} />
+                ))}
+              </React.Fragment>
+            ))}
+            {!turns.length && <div className="empty-chat">新建会话后，在下方输入你的需求。Codex 会以事件流形式展示推理摘要、执行步骤和结果。</div>}
+          </div>
+          <form className="chat-composer" onSubmit={sendTurn}>
+            <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="像使用 Codex 一样描述任务..." />
+            <button className="primary" disabled={!selectedId || !message.trim()}><Play size={16} />发送</button>
+          </form>
+          <form className="steer-bar" onSubmit={steer}>
+            <input value={steerText} onChange={(event) => setSteerText(event.target.value)} placeholder={running ? '运行中补充说明...' : '当前没有运行中的 turn'} />
+            <button className="ghost" disabled={!running || !steerText.trim()}><Zap size={16} />补充</button>
+            <button className="danger-btn" type="button" disabled={!running} onClick={interrupt}><Square size={14} />打断</button>
+          </form>
+        </Panel>
+
+        <Panel className="observer-panel" title="执行观察" action={<button className="ghost" onClick={() => setDebug(!debug)}>{debug ? '摘要模式' : '调试模式'}</button>}>
+          <div className="event-rail">
+            {(debug ? events : summarizeEvents(events)).map((event) => (
+              <EventCard key={event.id || `${event.type}-${event.createdAt}`} event={event} debug={debug} approvals={approvals} onResolve={resolveApproval} />
+            ))}
+            {!events.length && <p className="muted">等待 Agent 事件...</p>}
+          </div>
+        </Panel>
       </div>
     </section>
   );
@@ -500,6 +662,89 @@ function TaskDetail({ task, detailed = false }) {
       </div>
     </div>
   );
+}
+
+function ChatBubble({ role, text, meta }) {
+  const assistant = role !== 'user';
+  return (
+    <div className={`chat-bubble ${assistant ? 'assistant' : 'user'}`}>
+      <div className="bubble-meta">{assistant ? 'Agent' : '你'} · {meta}</div>
+      <div>{text || '...'}</div>
+    </div>
+  );
+}
+
+function EventCard({ event, debug, approvals, onResolve }) {
+  const approvalId = event.payload?.approvalId;
+  const approval = approvalId ? approvals.find((item) => item.id === approvalId) : null;
+  return (
+    <div className={`event-card ${event.type?.includes('error') ? 'danger' : ''}`}>
+      <div className="event-card-head">
+        <EventIcon type={event.type} />
+        <strong>{eventLabel(event.type)}</strong>
+        <small>{event.createdAt ? new Date(event.createdAt).toLocaleTimeString() : ''}</small>
+      </div>
+      {(event.summary || event.text) && <p>{event.summary || event.text}</p>}
+      {approval?.status === 'pending' && (
+        <div className="approval-actions">
+          <button className="primary" onClick={() => onResolve(approval.id, 'allow')}><CheckCircle2 size={15} />允许</button>
+          <button className="danger-btn" onClick={() => onResolve(approval.id, 'deny')}><Square size={13} />拒绝</button>
+        </div>
+      )}
+      {debug && <pre>{JSON.stringify(event.payload || event, null, 2)}</pre>}
+    </div>
+  );
+}
+
+function EventIcon({ type = '' }) {
+  if (type.includes('command')) return <Terminal size={15} />;
+  if (type.includes('file')) return <FileText size={15} />;
+  if (type.includes('approval')) return <ShieldCheck size={15} />;
+  if (type.includes('reasoning') || type.includes('plan')) return <Activity size={15} />;
+  if (type.includes('error')) return <CircleHelp size={15} />;
+  if (type.includes('turn')) return <Loader2 size={15} />;
+  return <Bot size={15} />;
+}
+
+function eventsForTurn(events, turnId) {
+  return events.filter((event) => event.turnId === turnId);
+}
+
+function isConversationEvent(event) {
+  return ['agent.delta', 'agent.message', 'reasoning.summary', 'plan.update', 'error'].includes(event.type);
+}
+
+function summarizeEvents(events) {
+  return events.filter((event) => (
+    event.type?.startsWith('turn.')
+    || event.type === 'reasoning.summary'
+    || event.type === 'plan.update'
+    || event.type?.startsWith('command.')
+    || event.type === 'file.changed'
+    || event.type === 'approval.requested'
+    || event.type === 'error'
+  ));
+}
+
+function eventLabel(type = '') {
+  const labels = {
+    'user.message': '用户消息',
+    'user.steer': '补充说明',
+    'agent.delta': '回复',
+    'agent.message': '回复',
+    'reasoning.summary': '推理摘要',
+    'plan.update': '计划更新',
+    'command.started': '命令开始',
+    'command.completed': '命令完成',
+    'file.changed': '文件变更',
+    'approval.requested': '等待确认',
+    'approval.resolved': '确认完成',
+    'turn.started': 'Turn 开始',
+    'turn.completed': 'Turn 完成',
+    'turn.interrupt.requested': '请求打断',
+    error: '错误',
+  };
+  return labels[type] || type || '事件';
 }
 
 function QuickActions() {
